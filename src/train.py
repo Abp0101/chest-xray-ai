@@ -44,14 +44,132 @@ from torch.utils.data import DataLoader
 # project root or from inside src/.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from dataset import build_dataloaders
+from dataset import build_dataloaders, DISEASE_LABELS
 from model import build_model, freeze_backbone, unfreeze_backbone
+
+# W&B is optional — if not installed or not wanted, every WandbLogger method
+# becomes a silent no-op so the rest of the code is unchanged.
+try:
+    import wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
 
 # ── paths ──────────────────────────────────────────────────────────────────────
 PROJECT_ROOT  = Path(__file__).resolve().parent.parent
 CKPT_DIR      = PROJECT_ROOT / "outputs" / "checkpoints"
+FIGURES_DIR   = PROJECT_ROOT / "outputs" / "figures"
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
+FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 LOSS_LOG_PATH = PROJECT_ROOT / "outputs" / "loss_log.csv"
+
+from dataset import RAW_DIR   # needed for Grad-CAM image lookup in W&B block
+
+
+# ── W&B logger ────────────────────────────────────────────────────────────────
+
+class WandbLogger:
+    """
+    Thin wrapper around the wandb API that degrades gracefully when wandb is
+    not installed or when the user passes --no-wandb.
+
+    Design principle: every public method is safe to call unconditionally.
+    The train loop never checks `if use_wandb` inline — it just calls the
+    logger and the logger decides whether to do anything.
+
+    Logged metrics
+    --------------
+    Per epoch (both stages):
+      train/loss    — average BCE loss over the training epoch
+      val/loss      — average BCE loss on the validation set
+      train/lr      — current learning rate (useful to see LR reductions)
+      epoch         — global epoch number (x-axis in W&B charts)
+
+    End of training (media):
+      roc_curves    — the 14-panel ROC curve figure as a W&B Image
+      gradcam_N     — up to 3 Grad-CAM overlay figures as W&B Images
+
+    After full test evaluation:
+      test/mean_auc        — mean AUC-ROC across all 14 classes
+      test/auc_<disease>   — per-class AUC for every label
+    """
+
+    def __init__(
+        self,
+        enabled: bool,
+        project: str,
+        config:  dict,
+    ) -> None:
+        self.enabled = enabled and _WANDB_AVAILABLE
+
+        if self.enabled:
+            if not _WANDB_AVAILABLE:
+                print("Warning: wandb not installed — logging disabled.")
+                self.enabled = False
+                return
+            wandb.init(
+                project=project,
+                config=config,
+                # Save code so you can reproduce runs from the W&B UI
+                save_code=True,
+            )
+            print(f"W&B run: {wandb.run.url}\n")
+
+    def log_epoch(
+        self,
+        epoch:      int,
+        stage:      str,
+        train_loss: float,
+        val_loss:   float,
+        lr:         float,
+    ) -> None:
+        """Log scalar metrics for one epoch."""
+        if not self.enabled:
+            return
+        wandb.log({
+            "epoch":      epoch,
+            "stage":      stage,
+            "train/loss": train_loss,
+            "val/loss":   val_loss,
+            "train/lr":   lr,
+        }, step=epoch)
+
+    def log_auc(self, aucs: dict[str, float], mean_auc: float) -> None:
+        """
+        Log per-class and mean AUC after the test set evaluation.
+        Called once at the end of training.
+        """
+        if not self.enabled:
+            return
+        metrics = {"test/mean_auc": mean_auc}
+        for label, auc in aucs.items():
+            if not __import__("math").isnan(auc):
+                metrics[f"test/auc_{label}"] = auc
+        wandb.log(metrics)
+
+    def log_roc_figure(self, fig_path: Path) -> None:
+        """Upload the saved ROC curves PNG as a W&B Image."""
+        if not self.enabled or not fig_path.exists():
+            return
+        wandb.log({"roc_curves": wandb.Image(str(fig_path),
+                                             caption="Per-class ROC curves")})
+
+    def log_gradcam_figures(self, figures_dir: Path, n: int = 3) -> None:
+        """
+        Upload the first n Grad-CAM overlay PNGs from figures_dir.
+        Files are matched by the gradcam_* prefix written by evaluate.py.
+        """
+        if not self.enabled:
+            return
+        paths = sorted(figures_dir.glob("gradcam_*.png"))[:n]
+        if not paths:
+            return
+        images = [wandb.Image(str(p), caption=p.stem) for p in paths]
+        wandb.log({"gradcam_samples": images})
+
+    def finish(self) -> None:
+        if self.enabled:
+            wandb.finish()
 
 
 # ── device ────────────────────────────────────────────────────────────────────
@@ -230,14 +348,16 @@ class LossLogger:
 # ── main training function ────────────────────────────────────────────────────
 
 def train(
-    epochs_stage1: int = 3,
-    epochs_stage2: int = 12,
-    batch_size:    int = 32,
-    lr_stage1:     float = 1e-3,
-    lr_stage2:     float = 1e-4,
-    num_workers:   int = 4,
-    dropout:       float = 0.5,
-    seed:          int = 42,
+    epochs_stage1:  int   = 3,
+    epochs_stage2:  int   = 12,
+    batch_size:     int   = 32,
+    lr_stage1:      float = 1e-3,
+    lr_stage2:      float = 1e-4,
+    num_workers:    int   = 4,
+    dropout:        float = 0.5,
+    seed:           int   = 42,
+    use_wandb:      bool  = True,
+    wandb_project:  str   = "chest-xray-classifier",
 ) -> None:
     """
     Full two-stage training loop.
@@ -263,6 +383,26 @@ def train(
     torch.manual_seed(seed)
     device = get_device()
     print(f"Training on device: {device}\n")
+
+    # ── W&B ───────────────────────────────────────────────────────────────────
+    # Initialise before any training so hyperparameters are captured in the run.
+    # Passing the full config dict means every hyperparameter is searchable and
+    # comparable across runs in the W&B UI.
+    wb = WandbLogger(
+        enabled=use_wandb,
+        project=wandb_project,
+        config=dict(
+            epochs_stage1=epochs_stage1,
+            epochs_stage2=epochs_stage2,
+            batch_size=batch_size,
+            lr_stage1=lr_stage1,
+            lr_stage2=lr_stage2,
+            dropout=dropout,
+            seed=seed,
+            architecture="densenet121",
+            dataset="NIH-CXR-14",
+        ),
+    )
 
     # ── data ──────────────────────────────────────────────────────────────────
     print("Building DataLoaders …")
@@ -318,12 +458,14 @@ def train(
         val_loss = evaluate(model, val_loader, criterion, device)
         elapsed  = time.time() - t0
 
+        current_lr = optimizer_s1.param_groups[0]["lr"]
         print(
             f"  Epoch {epoch_global:>3} [stage1]  "
             f"train: {train_loss:.4f}  val: {val_loss:.4f}  "
             f"({elapsed:.0f}s)"
         )
         logger.log(epoch_global, "stage1", train_loss, val_loss, elapsed)
+        wb.log_epoch(epoch_global, "stage1", train_loss, val_loss, current_lr)
 
         # Save best checkpoint
         if val_loss < best_val_loss:
@@ -389,6 +531,7 @@ def train(
             f"lr: {current_lr:.2e}  ({elapsed:.0f}s)"
         )
         logger.log(epoch_global, "stage2", train_loss, val_loss, elapsed)
+        wb.log_epoch(epoch_global, "stage2", train_loss, val_loss, current_lr)
 
         # Save best checkpoint
         if val_loss < best_val_loss:
@@ -409,6 +552,47 @@ def train(
     print(f"Best checkpoint : {CKPT_DIR / 'best_model.pth'}")
     print(f"Loss log        : {LOSS_LOG_PATH}")
 
+    # ── W&B — post-training media and metrics ─────────────────────────────────
+    # We defer AUC computation and Grad-CAM to here so they don't slow down
+    # the training loop.  We load the BEST checkpoint (not last) to ensure
+    # the logged metrics reflect the model we're actually shipping.
+    if wb.enabled:
+        print("\nRunning post-training evaluation for W&B …")
+        from evaluate import (
+            collect_predictions, compute_aucs, print_auc_table,
+            plot_roc_curves, run_gradcam, build_image_index,
+        )
+
+        # Reload best weights (training finished on last weights, not best)
+        best_model = build_model(dropout=dropout).to(device)
+        best_ckpt  = torch.load(
+            CKPT_DIR / "best_model.pth", map_location=device, weights_only=True
+        )
+        best_model.load_state_dict(best_ckpt["model_state_dict"])
+        best_model.eval()
+
+        # AUC on test set
+        _, _, test_loader, _ = build_dataloaders(
+            batch_size=batch_size, num_workers=num_workers, seed=seed
+        )
+        probs, labels = collect_predictions(best_model, test_loader, device)
+        aucs     = compute_aucs(probs, labels)
+        mean_auc = print_auc_table(aucs)
+        wb.log_auc(aucs, mean_auc)
+
+        # ROC curves figure
+        roc_path = FIGURES_DIR / "roc_curves.png"
+        plot_roc_curves(probs, labels, aucs, roc_path)
+        wb.log_roc_figure(roc_path)
+
+        # 3 Grad-CAM samples
+        image_index = build_image_index(RAW_DIR)
+        run_gradcam(best_model, test_loader.dataset, image_index,
+                    device, n_samples=3)
+        wb.log_gradcam_figures(FIGURES_DIR, n=3)
+
+    wb.finish()
+
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -422,6 +606,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--workers",       type=int,   default=4,    help="DataLoader workers")
     p.add_argument("--dropout",       type=float, default=0.5,  help="head dropout rate")
     p.add_argument("--seed",          type=int,   default=42)
+    p.add_argument("--no-wandb",      action="store_true",
+                   help="disable Weights & Biases logging")
+    p.add_argument("--wandb-project", type=str, default="chest-xray-classifier",
+                   help="W&B project name")
     return p.parse_args()
 
 
@@ -436,4 +624,6 @@ if __name__ == "__main__":
         num_workers=args.workers,
         dropout=args.dropout,
         seed=args.seed,
+        use_wandb=not args.no_wandb,
+        wandb_project=args.wandb_project,
     )

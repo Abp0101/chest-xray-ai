@@ -1,0 +1,300 @@
+"""
+app.py
+------
+Gradio demo for the NIH Chest X-Ray 14 classifier.
+Designed to run as a Hugging Face Spaces app or locally.
+
+Usage (local):
+    pip install gradio huggingface_hub
+    python app.py
+
+Usage (HF Spaces):
+    Push this repo to a Hugging Face Space (SDK: Gradio).
+    Upload your trained checkpoint to HF Hub and set HF_MODEL_REPO below,
+    or commit best_model.pth directly into the Space repo (≤100 MB limit
+    means you should use Git LFS or HF Hub model hosting).
+
+What the demo does
+------------------
+1. User uploads a chest X-ray image (any format PIL can read).
+2. The image is preprocessed with the same val-time transforms used in
+   training (Resize 256 → CenterCrop 224 → ImageNet normalise).
+3. DenseNet-121 runs a forward pass → 14 sigmoid probabilities.
+4. Grad-CAM highlights which regions drove the top prediction.
+5. Returns:
+     - A Grad-CAM overlay image (original X-ray with heatmap blended in)
+     - A bar chart of all 14 predicted probabilities
+     - A plain-text summary of the top 3 findings
+
+Disclaimer
+----------
+This tool is for research and educational purposes only.
+It is NOT a medical device and must NOT be used for clinical decision-making.
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import matplotlib
+matplotlib.use("Agg")   # headless backend — no display needed in Spaces
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+
+# ── path setup ────────────────────────────────────────────────────────────────
+# This file lives at the project root; src/ modules are one level down.
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from dataset import DISEASE_LABELS, get_val_transforms
+from model   import build_model
+from evaluate import GradCAM, _denormalize
+
+# ── checkpoint loading ────────────────────────────────────────────────────────
+
+# Where to look for the checkpoint locally (works when running from project root)
+LOCAL_CKPT = PROJECT_ROOT / "outputs" / "checkpoints" / "best_model.pth"
+
+# If the checkpoint is not local, attempt to download from Hugging Face Hub.
+# Set this to your own model repo, e.g. "your-username/chest-xray-densenet121"
+# Leave as None to skip Hub download and rely on the local file.
+HF_MODEL_REPO     = os.environ.get("HF_MODEL_REPO", None)
+HF_MODEL_FILENAME = "best_model.pth"
+
+
+def _get_device() -> torch.device:
+    """
+    Pick the best available device.
+    Order of preference: CUDA (Spaces GPU) → MPS (Apple Silicon) → CPU.
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+
+def _load_checkpoint() -> Path:
+    """
+    Return a path to the checkpoint, downloading from HF Hub if necessary.
+    Raises FileNotFoundError if neither local nor Hub source is available.
+    """
+    if LOCAL_CKPT.exists():
+        return LOCAL_CKPT
+
+    if HF_MODEL_REPO:
+        try:
+            from huggingface_hub import hf_hub_download
+            print(f"Downloading checkpoint from HF Hub: {HF_MODEL_REPO} …")
+            downloaded = hf_hub_download(
+                repo_id=HF_MODEL_REPO,
+                filename=HF_MODEL_FILENAME,
+                # cache_dir puts it in ~/.cache/huggingface on Spaces
+            )
+            return Path(downloaded)
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Could not download checkpoint from HF Hub ({HF_MODEL_REPO}): {e}"
+            ) from e
+
+    raise FileNotFoundError(
+        f"No checkpoint found at {LOCAL_CKPT}.\n"
+        "Train the model first (`python src/train.py`) or set HF_MODEL_REPO "
+        "to download from Hugging Face Hub."
+    )
+
+
+# ── load model once at startup ────────────────────────────────────────────────
+# Models are loaded once when the Space starts, not on every request.
+# This is much faster than reloading weights for each user.
+
+DEVICE = _get_device()
+print(f"Demo device: {DEVICE}")
+
+try:
+    ckpt_path = _load_checkpoint()
+    _model = build_model()
+    _ckpt  = torch.load(ckpt_path, map_location=DEVICE, weights_only=True)
+    _model.load_state_dict(_ckpt["model_state_dict"])
+    _model.to(DEVICE)
+    _model.eval()
+    print(f"Model loaded from {ckpt_path.name}  "
+          f"(epoch {_ckpt.get('epoch','?')}, "
+          f"val_loss {_ckpt.get('val_loss', float('nan')):.4f})")
+    MODEL_READY = True
+except FileNotFoundError as e:
+    print(f"WARNING: {e}")
+    _model     = None
+    MODEL_READY = False
+
+TRANSFORM = get_val_transforms()
+
+
+# ── inference helpers ─────────────────────────────────────────────────────────
+
+def _build_prob_chart(probs: np.ndarray) -> plt.Figure:
+    """
+    Return a matplotlib Figure showing a horizontal bar chart of all 14
+    predicted probabilities, sorted descending.
+
+    A vertical red line at 0.5 marks a naive decision threshold so users can
+    see at a glance which conditions the model considers likely.
+    """
+    sorted_idx  = np.argsort(probs)          # ascending; we'll invert the axis
+    labels_sorted = [DISEASE_LABELS[i] for i in sorted_idx]
+    probs_sorted  = probs[sorted_idx]
+
+    # Colour bars by confidence: red if > 0.5, steelblue otherwise
+    colours = ["#e05c5c" if p > 0.5 else "steelblue" for p in probs_sorted]
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    bars = ax.barh(labels_sorted, probs_sorted, color=colours, edgecolor="white")
+    ax.set_xlim(0, 1)
+    ax.axvline(0.5, color="red", linestyle="--", linewidth=0.8, alpha=0.6,
+               label="0.5 threshold")
+    ax.set_xlabel("Predicted probability")
+    ax.set_title("Model predictions (all 14 conditions)")
+    ax.legend(fontsize=8)
+
+    # Annotate values on the bars
+    for bar, p in zip(bars, probs_sorted):
+        ax.text(min(p + 0.02, 0.97), bar.get_y() + bar.get_height() / 2,
+                f"{p:.2f}", va="center", fontsize=7)
+
+    plt.tight_layout()
+    return fig
+
+
+def _build_gradcam_overlay(
+    tensor:       torch.Tensor,   # (1, 3, 224, 224) on DEVICE
+    target_class: int,
+) -> np.ndarray:
+    """
+    Run Grad-CAM and return an RGB uint8 blend image (224, 224, 3).
+
+    We create and immediately destroy the GradCAM object so hooks don't
+    accumulate across requests (important in a long-running server process).
+    """
+    grad_cam = GradCAM(_model, target_layer_name="features.denseblock4")
+    cam, _, _ = grad_cam.generate(tensor, target_class=target_class)
+    grad_cam.remove_hooks()
+
+    # Denormalise original image
+    original = _denormalize(tensor.squeeze(0))   # (224, 224, 3) uint8
+
+    # Colour the CAM and blend
+    colormap = cm.get_cmap("jet")
+    cam_rgb  = (colormap(cam)[:, :, :3] * 255).astype(np.uint8)
+    blend    = (0.55 * original + 0.45 * cam_rgb).astype(np.uint8)
+    return blend
+
+
+# ── main prediction function ──────────────────────────────────────────────────
+
+def predict(uploaded_image: Image.Image):
+    """
+    Entry point called by Gradio for every user request.
+
+    Args:
+        uploaded_image : PIL Image provided by the user.
+
+    Returns:
+        gradcam_overlay : PIL Image — Grad-CAM heatmap blended onto the X-ray.
+        prob_chart      : matplotlib Figure — bar chart of all 14 probabilities.
+        summary_text    : str — plain-text top-3 findings for screen readers.
+    """
+    if not MODEL_READY:
+        error_msg = (
+            "Model checkpoint not found. "
+            "Please train the model first or configure HF_MODEL_REPO."
+        )
+        # Return empty outputs with error message
+        return None, None, error_msg
+
+    # ── preprocess ────────────────────────────────────────────────────────────
+    # Convert to RGB in case the user uploaded a grayscale or RGBA image.
+    # The same RGB conversion is applied during training (dataset.py).
+    image_rgb = uploaded_image.convert("RGB")
+    tensor    = TRANSFORM(image_rgb).unsqueeze(0).to(DEVICE)   # (1,3,224,224)
+
+    # ── inference ─────────────────────────────────────────────────────────────
+    with torch.no_grad():
+        logits = _model(tensor)              # (1, 14)
+        probs  = torch.sigmoid(logits)       # (1, 14) in [0,1]
+
+    probs_np = probs.cpu().numpy()[0]        # (14,)
+
+    # Top predicted class drives the Grad-CAM explanation
+    top_class = int(np.argmax(probs_np))
+
+    # ── Grad-CAM overlay ──────────────────────────────────────────────────────
+    # Grad-CAM needs gradients, so we do NOT use torch.no_grad() here.
+    blend_np     = _build_gradcam_overlay(tensor, top_class)
+    gradcam_pil  = Image.fromarray(blend_np)
+
+    # ── probability chart ─────────────────────────────────────────────────────
+    prob_fig = _build_prob_chart(probs_np)
+
+    # ── plain-text summary ────────────────────────────────────────────────────
+    # Sort by probability descending; show top 3 with probabilities
+    top3_idx = np.argsort(probs_np)[::-1][:3]
+    lines    = ["Top predictions:"]
+    for i, idx in enumerate(top3_idx, 1):
+        lines.append(f"  {i}. {DISEASE_LABELS[idx]}: {probs_np[idx]:.1%}")
+    lines.append("")
+    lines.append(
+        "DISCLAIMER: Research tool only. Not for clinical use."
+    )
+    summary = "\n".join(lines)
+
+    return gradcam_pil, prob_fig, summary
+
+
+# ── Gradio interface ──────────────────────────────────────────────────────────
+
+import gradio as gr
+
+# Example images that load into the interface on the HF Spaces page.
+# Remove this list if you don't have example files in the repo.
+EXAMPLES_DIR = PROJECT_ROOT / "outputs" / "figures"
+example_files = sorted(EXAMPLES_DIR.glob("gradcam_*.png"))[:2]
+examples = [[str(p)] for p in example_files] if example_files else None
+
+demo = gr.Interface(
+    fn=predict,
+    inputs=gr.Image(
+        type="pil",
+        label="Upload a chest X-ray (PA or AP view)",
+    ),
+    outputs=[
+        gr.Image(
+            type="pil",
+            label="Grad-CAM — regions driving the top prediction",
+        ),
+        gr.Plot(
+            label="Predicted probabilities for all 14 conditions",
+        ),
+        gr.Textbox(
+            label="Summary",
+            lines=6,
+        ),
+    ],
+    title="Chest X-Ray Disease Classifier",
+    description=(
+        "Upload a frontal chest X-ray to get predictions for 14 thoracic conditions "
+        "using a fine-tuned DenseNet-121 trained on the NIH Chest X-Ray 14 dataset.\n\n"
+        "The Grad-CAM overlay highlights which regions of the X-ray the model focused on "
+        "when making its top prediction (red = most influential).\n\n"
+        "**This is a research tool. Do not use for medical diagnosis.**"
+    ),
+    examples=examples,
+    allow_flagging="never",
+    theme=gr.themes.Soft(),
+)
+
+if __name__ == "__main__":
+    demo.launch(share=False)

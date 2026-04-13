@@ -1,0 +1,19 @@
+# Core ML
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Data / metrics
+numpy
+pandas
+scikit-learn
+Pillow
+
+# Visualisation
+matplotlib
+
+# Demo
+gradio>=4.0.0
+huggingface_hub>=0.20.0
+
+# Experiment tracking (optional — only needed for training)
+wandb
