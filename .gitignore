@@ -1,0 +1,54 @@
+# ── Credentials & secrets ──────────────────────────────────────────────────────
+# Never commit real credentials. Copy .env.example → .env and fill in values.
+.env
+*.key
+*.pem
+kaggle.json          # should live at ~/.kaggle/kaggle.json, not here
+
+# ── Dataset (large binary files) ──────────────────────────────────────────────
+# The NIH CXR-14 dataset is ~45 GB. Download it with: python src/download_data.py
+data/raw/
+data/processed/
+
+# ── Model checkpoints ─────────────────────────────────────────────────────────
+# Weights can be hundreds of MB. Use wandb / HuggingFace Hub to share them.
+outputs/checkpoints/
+models/
+*.pth
+*.pt
+*.ckpt
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Jupyter ────────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+# Uncomment the next line if you want to strip notebook outputs before commit:
+# *.ipynb
+
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ── Claude Code local config ──────────────────────────────────────────────────
+# settings.local.json holds machine-specific Claude Code permissions.
+# CLAUDE.md (project instructions) is safe to commit if you create one.
+.claude/settings.local.json
+
+# ── Outputs (keep figures, ignore large logs) ─────────────────────────────────
+# outputs/figures/ is intentionally NOT ignored so charts can be committed.
+outputs/logs/
+wandb/
