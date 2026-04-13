@@ -136,19 +136,24 @@ TRANSFORM = get_val_transforms()
 
 # ── inference helpers ─────────────────────────────────────────────────────────
 
-def _build_prob_chart(probs: np.ndarray) -> plt.Figure:
+def _build_prob_chart(probs: np.ndarray) -> Image.Image:
     """
-    Return a matplotlib Figure showing a horizontal bar chart of all 14
-    predicted probabilities, sorted descending.
+    Render a horizontal bar chart of all 14 predicted probabilities and
+    return it as a PIL Image.
 
-    A vertical red line at 0.5 marks a naive decision threshold so users can
-    see at a glance which conditions the model considers likely.
+    We return PIL instead of a matplotlib Figure to avoid gr.Plot, which
+    generates a complex JSON schema that triggers a bool-iteration bug in
+    gradio_client<=1.3.0.  gr.Image accepts PIL directly and has a simple,
+    bug-free schema.
+
+    A vertical red line at 0.5 marks a naive decision threshold.
     """
-    sorted_idx  = np.argsort(probs)          # ascending; we'll invert the axis
+    import io
+
+    sorted_idx    = np.argsort(probs)          # ascending
     labels_sorted = [DISEASE_LABELS[i] for i in sorted_idx]
     probs_sorted  = probs[sorted_idx]
 
-    # Colour bars by confidence: red if > 0.5, steelblue otherwise
     colours = ["#e05c5c" if p > 0.5 else "steelblue" for p in probs_sorted]
 
     fig, ax = plt.subplots(figsize=(7, 5))
@@ -160,13 +165,18 @@ def _build_prob_chart(probs: np.ndarray) -> plt.Figure:
     ax.set_title("Model predictions (all 14 conditions)")
     ax.legend(fontsize=8)
 
-    # Annotate values on the bars
     for bar, p in zip(bars, probs_sorted):
         ax.text(min(p + 0.02, 0.97), bar.get_y() + bar.get_height() / 2,
                 f"{p:.2f}", va="center", fontsize=7)
 
     plt.tight_layout()
-    return fig
+
+    # Render to a PIL Image via an in-memory PNG buffer
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return Image.open(buf).copy()   # .copy() detaches from the BytesIO buffer
 
 
 def _build_gradcam_overlay(
@@ -275,7 +285,8 @@ demo = gr.Interface(
             type="pil",
             label="Grad-CAM — regions driving the top prediction",
         ),
-        gr.Plot(
+        gr.Image(
+            type="pil",
             label="Predicted probabilities for all 14 conditions",
         ),
         gr.Textbox(
@@ -293,8 +304,11 @@ demo = gr.Interface(
     ),
     examples=examples,
     allow_flagging="never",
-    theme=gr.themes.Soft(),
+    # gr.themes was added in Gradio 4 — omit for 3.x compatibility
 )
 
 if __name__ == "__main__":
-    demo.launch(share=False)
+    # share=False works fine in gradio 4.x on Mac (the localhost-inaccessible
+    # error only affected certain 3.x builds).  Set share=True if you want a
+    # temporary public URL via Gradio's tunnel service.
+    demo.launch(share=False, server_name="127.0.0.1", show_error=True)

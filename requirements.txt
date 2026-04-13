@@ -11,8 +11,13 @@ Pillow
 # Visualisation
 matplotlib
 
-# Demo
-gradio>=4.0.0
+# Demo — pinned stack for compatibility
+# gradio_client<=1.3.0 has a bool-iteration bug in gr.Plot schema generation;
+# we avoid it by using gr.Image for all outputs (no gr.Plot).
+# gr.themes.Soft() requires Gradio 4+; omitted for safety.
+gradio==4.44.1
+fastapi==0.111.1
+starlette==0.37.2
 huggingface_hub>=0.20.0
 
 # Experiment tracking (optional — only needed for training)
