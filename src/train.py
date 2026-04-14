@@ -508,7 +508,7 @@ def train(
         mode="min",
         factor=0.5,
         patience=2,
-        verbose=True,
+        
     )
 
     for epoch in range(1, epochs_stage2 + 1):

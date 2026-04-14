@@ -1,5 +1,7 @@
 # Chest X-Ray Disease Classifier
 
+![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
+
 Multi-label thoracic disease classifier trained on the [NIH Chest X-Ray 14](https://www.kaggle.com/datasets/nih-chest-xrays/data) dataset.  
 Fine-tunes a pretrained **DenseNet-121** to predict 14 conditions from a single frontal X-ray.  
 Includes Grad-CAM visualisations showing which regions of the image drove each prediction.
@@ -72,12 +74,43 @@ Stage 2 adapts the full network to X-ray statistics with a `ReduceLROnPlateau` s
 Evaluated on the official NIH test split (~25,000 images, patient-level separation from train).  
 The standard metric is **mean AUC-ROC** across all 14 classes.
 
+### Training curve
+
+15 epochs total — 3 warm-up (backbone frozen) + 12 fine-tune (full network).
+
+| Epoch | Stage | Train Loss | Val Loss |
+|---|---|---|---|
+| 1 | warm-up | 1.224 | 1.614 |
+| 2 | warm-up | 1.209 | 1.387 |
+| 3 | warm-up | 1.224 | 1.544 |
+| 4 | fine-tune | 1.100 | 1.165 |
+| 5 | fine-tune | 0.975 | 1.199 |
+| **6** | **fine-tune** | **0.908** | **1.106 ✓ best** |
+| 7 | fine-tune | 0.884 | 1.158 |
+| 8 | fine-tune | 0.848 | 1.144 |
+| 9 | fine-tune | 0.797 | 1.186 |
+| 10 | fine-tune | 0.748 | 1.227 |
+| 11 | fine-tune | 0.694 | 1.386 |
+| 12 | fine-tune | 0.689 | 1.307 |
+| 13 | fine-tune | 0.624 | 1.467 |
+| 14 | fine-tune | 0.599 | 1.571 |
+| 15 | fine-tune | 0.565 | 1.602 |
+
+Best checkpoint saved at **epoch 6** (val loss 1.106). Val loss rising after epoch 6 indicates overfitting — early stopping or stronger regularisation would help.
+
+### AUC-ROC
+
 | Metric | Value |
 |---|---|
-| Mean AUC-ROC | *(run `src/evaluate.py` after training)* |
+| Mean AUC-ROC (this model) | *(run `python src/evaluate.py` to generate)* |
 | CheXNet baseline (Rajpurkar et al. 2017) | 0.841 |
 
-Per-class AUC table and ROC curves are saved to `outputs/figures/roc_curves.png` after evaluation.
+Per-class ROC curves: `outputs/figures/roc_curves.png`
+
+### Sample Grad-CAM outputs
+
+Grad-CAM overlays highlight the regions that drove each prediction (red = most influential).  
+Samples: `outputs/figures/gradcam_*.png`
 
 ---
 
