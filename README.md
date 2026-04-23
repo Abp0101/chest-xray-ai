@@ -102,8 +102,27 @@ Best checkpoint saved at **epoch 6** (val loss 1.106). Val loss rising after epo
 
 | Metric | Value |
 |---|---|
-| Mean AUC-ROC (this model) | *(run `python src/evaluate.py` to generate)* |
+| Mean AUC-ROC (this model) | **0.7851** |
 | CheXNet baseline (Rajpurkar et al. 2017) | 0.841 |
+
+#### Per-class AUC-ROC (test set, 25,596 images)
+
+| Disease | AUC-ROC |
+|---|---|
+| Hernia | 0.9215 |
+| Cardiomegaly | 0.8741 |
+| Emphysema | 0.8414 |
+| Pneumothorax | 0.8363 |
+| Edema | 0.8135 |
+| Fibrosis | 0.8104 |
+| Effusion | 0.7984 |
+| Mass | 0.7884 |
+| Atelectasis | 0.7446 |
+| Pleural_Thickening | 0.7347 |
+| Nodule | 0.7344 |
+| Consolidation | 0.7261 |
+| Pneumonia | 0.6891 |
+| Infiltration | 0.6786 |
 
 Per-class ROC curves: `outputs/figures/roc_curves.png`
 
