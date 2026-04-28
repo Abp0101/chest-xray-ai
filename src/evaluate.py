@@ -1,28 +1,10 @@
 """
-evaluate.py
------------
-Loads best_model.pth and runs three things on the held-out test set:
+Evaluate the trained model on the NIH CXR-14 test set.
 
-  1. AUC-ROC evaluation
-       - Collects raw sigmoid probabilities for all 14 classes over the full
-         test set (no thresholding — AUC is threshold-free).
-       - Prints a per-class summary table sorted by AUC descending.
-       - Prints the mean AUC (the standard single-number metric for NIH CXR-14;
-         the original CheXNet paper reported mean AUC = 0.841).
-
-  2. ROC curve figure
-       - Plots all 14 ROC curves on a 3×5 grid with per-class AUC in each
-         panel title.
-       - Saves to outputs/figures/roc_curves.png.
-
-  3. Grad-CAM heatmaps
-       - For N random test images, generates a heatmap showing which spatial
-         regions of the X-ray drove the top predicted class.
-       - Overlays the heatmap on the original image in a side-by-side panel.
-       - Saves each to outputs/figures/gradcam_<filename>.png.
+Outputs: per-class AUC-ROC table, ROC curve figure, and Grad-CAM overlays.
 
 Usage:
-    python src/evaluate.py                        # uses best_model.pth
+    python src/evaluate.py
     python src/evaluate.py --ckpt outputs/checkpoints/last_model.pth
     python src/evaluate.py --n-gradcam 10
 """
@@ -74,16 +56,7 @@ def get_device() -> torch.device:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def load_model(ckpt_path: Path, device: torch.device) -> nn.Module:
-    """
-    Reconstruct the DenseNet-121 architecture and load saved weights.
-
-    We build the model first (random weights) then overlay the saved
-    state_dict.  map_location ensures the tensors land on the right device
-    regardless of which device they were saved from.
-
-    The checkpoint was saved on CPU by train.py (device-agnostic convention),
-    so map_location handles the CPU→MPS transfer automatically.
-    """
+    """Load DenseNet-121 weights from a checkpoint."""
     if not ckpt_path.exists():
         raise FileNotFoundError(
             f"Checkpoint not found: {ckpt_path}\n"
@@ -112,21 +85,7 @@ def collect_predictions(
     loader: DataLoader,
     device: torch.device,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Run the full test set through the model and return raw probabilities and
-    ground-truth labels as numpy arrays.
-
-    Why sigmoid here but not during training?
-    -----------------------------------------
-    BCEWithLogitsLoss applies sigmoid internally during training (numerically
-    stable).  For evaluation we need actual probabilities in [0, 1] so that
-    sklearn's roc_auc_score can rank predictions correctly.  We apply sigmoid
-    explicitly at inference time.
-
-    Returns:
-        probs  : float32 array, shape (N, 14) — predicted probabilities
-        labels : float32 array, shape (N, 14) — ground-truth binary labels
-    """
+    """Return (probs, labels) arrays over the full DataLoader."""
     all_probs  = []
     all_labels = []
 
@@ -156,20 +115,7 @@ def compute_aucs(
     probs: np.ndarray,
     labels: np.ndarray,
 ) -> dict[str, float]:
-    """
-    Compute per-class AUC-ROC scores.
-
-    AUC-ROC measures the probability that the model ranks a random positive
-    example higher than a random negative one.  It is threshold-free and
-    robust to class imbalance — which is why it is the standard metric for
-    this dataset.
-
-    We skip any class that has zero positives in the test set (AUC is
-    undefined), returning NaN so the mean is still meaningful.
-
-    Returns:
-        dict mapping label name → AUC score (or NaN if undefined).
-    """
+    """Compute per-class AUC-ROC; returns NaN for any class with no positives."""
     aucs = {}
     for i, label in enumerate(DISEASE_LABELS):
         n_pos = labels[:, i].sum()
@@ -182,12 +128,7 @@ def compute_aucs(
 
 
 def print_auc_table(aucs: dict[str, float]) -> float:
-    """
-    Print a formatted table of per-class AUC scores and return mean AUC.
-
-    The mean AUC across all 14 classes is the headline metric used in the
-    NIH paper and all subsequent benchmarks on this dataset.
-    """
+    """Print a per-class AUC table sorted descending and return mean AUC."""
     print("\n" + "═" * 45)
     print(f"  {'Disease':<22}  {'AUC-ROC':>8}  {'Positives':>9}")
     print("─" * 45)
@@ -217,21 +158,7 @@ def plot_roc_curves(
     aucs: dict[str, float],
     out_path: Path,
 ) -> None:
-    """
-    Plot all 14 ROC curves on a 3×5 grid and save to disk.
-
-    Each panel shows:
-      - The ROC curve for that class (TPR vs FPR)
-      - AUC score in the title
-      - A diagonal dashed line representing a random classifier (AUC = 0.5)
-        for visual reference.
-
-    TPR (True Positive Rate / Recall) = TP / (TP + FN)
-    FPR (False Positive Rate)         = FP / (FP + TN)
-
-    A perfect classifier hews to the top-left corner; a random one follows
-    the diagonal.
-    """
+    """Plot all 14 ROC curves on a 3×5 grid and save to out_path."""
     n_cols  = 5
     n_rows  = 3   # 15 panels — one will be empty for the 14th class
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(n_cols * 3.5, n_rows * 3.2))
@@ -274,45 +201,10 @@ def plot_roc_curves(
 
 class GradCAM:
     """
-    Gradient-weighted Class Activation Mapping for DenseNet-121.
+    Grad-CAM for DenseNet-121.
 
-    How Grad-CAM works
-    ------------------
-    For a given input image and target class c:
-
-      1. Run a forward pass, saving the feature maps A (shape H×W×K) at the
-         chosen convolutional layer (here: features.norm5, giving 7×7×1024).
-
-      2. Compute the gradient of the class score y^c (before softmax/sigmoid)
-         with respect to every feature map pixel:  dY^c / dA_k.
-
-      3. Global-average-pool those gradients over the spatial dimensions to
-         get a scalar importance weight α_k per channel:
-             α_k = (1/Z) Σ_{i,j}  dY^c / dA^k_{ij}
-
-      4. Compute the weighted combination of feature maps, then apply ReLU:
-             CAM = ReLU( Σ_k  α_k · A^k )
-         ReLU keeps only the regions that positively contribute to class c.
-
-      5. Upsample the 7×7 CAM to the input image size (224×224) using
-         bilinear interpolation and normalise to [0, 1].
-
-    Why features.denseblock4?
-    -------------------------
-    DenseNet-121's final dense block outputs 1024 channels at 7×7 spatial
-    resolution — the richest semantic representation before global average
-    pooling collapses the spatial dimensions entirely.  We hook here rather
-    than the subsequent features.norm5 because norm5's output is immediately
-    modified by an inplace F.relu_() call in DenseNet's forward(), which
-    conflicts with PyTorch's backward hook mechanism and raises a RuntimeError.
-    denseblock4 has no such inplace op on its output, so hooks work cleanly.
-
-    Why not torch.no_grad()?
-    ------------------------
-    Grad-CAM requires backward() to compute gradients, so we cannot use
-    torch.no_grad().  Instead we call model.eval() to disable Dropout, and
-    we only compute gradients for the single target-class score — not the
-    full loss — so memory usage stays manageable.
+    Hooks into features.denseblock4 (7×7×1024) rather than features.norm5
+    because norm5 has an inplace relu_ that conflicts with backward hooks.
     """
 
     def __init__(self, model: nn.Module, target_layer_name: str = "features.denseblock4"):
@@ -353,19 +245,8 @@ class GradCAM:
         target_class: int | None = None,
     ) -> tuple[np.ndarray, int, float]:
         """
-        Generate a Grad-CAM heatmap for the given image.
-
-        Args:
-            image_tensor : preprocessed image, shape (1, 3, H, W), on device.
-            target_class : which of the 14 classes to explain.
-                           If None, uses the class with the highest predicted
-                           probability (most confident prediction).
-
-        Returns:
-            cam          : float32 array, shape (H, W), values in [0, 1].
-                           High values = regions most influential for the class.
-            target_class : the class index that was explained.
-            prob         : the predicted probability for that class.
+        Return (cam, target_class, prob). Defaults to the top-predicted class.
+        cam is a float32 (H, W) array normalised to [0, 1].
         """
         self.model.eval()
         # image_tensor needs grad so the computation graph is built through it
@@ -381,32 +262,15 @@ class GradCAM:
 
         prob = float(probs[0, target_class].item())
 
-        # ── backward pass ─────────────────────────────────────────────────────
-        # Zero any pre-existing gradients, then backprop from the single
-        # target-class score.  This is NOT a full training step — we never
-        # call optimizer.step().  We just need the gradient signal to flow
-        # back to the hook at features.norm5.
         self.model.zero_grad()
         logits[0, target_class].backward()
-        # The backward hook fires here, saving gradients at features.norm5
 
-        # ── compute CAM ───────────────────────────────────────────────────────
-        # activations shape: (1, 1024, 7, 7)
-        # gradients  shape: (1, 1024, 7, 7)
         A     = self._activations[0]   # (1024, 7, 7)
         grads = self._gradients[0]     # (1024, 7, 7)
 
-        # α_k = global average pooling of gradients over spatial dims
-        # Shape: (1024,) — one importance weight per feature channel
-        alpha = grads.mean(dim=(1, 2))   # (1024,)
-
-        # Weighted sum: each feature map scaled by its importance
-        # einsum 'k, k h w -> h w' = Σ_k  alpha_k * A_k
-        cam = torch.einsum("k, k h w -> h w", alpha, A)
-
-        # ReLU: keep only regions that push the prediction positive.
-        # Negative contributions would represent evidence AGAINST the class.
-        cam = torch.relu(cam)
+        alpha = grads.mean(dim=(1, 2))   # per-channel importance weights
+        cam   = torch.einsum("k, k h w -> h w", alpha, A)
+        cam   = torch.relu(cam)
 
         # Upsample from 7×7 to the original input size (224×224)
         cam = cam.unsqueeze(0).unsqueeze(0)   # (1, 1, 7, 7) for interpolate

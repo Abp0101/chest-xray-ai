@@ -1,30 +1,9 @@
 """
-dataset.py
-----------
-Defines:
+Dataset and DataLoader setup for NIH CXR-14.
 
-  ChestXrayDataset  – PyTorch Dataset that reads NIH X-ray images and returns
-                      a float tensor + multi-hot label vector.
-
-  build_dataloaders – Builds train / val / test DataLoaders using the official
-                      NIH train_val_list.txt / test_list.txt splits, then
-                      further splits the train_val set 90/10 for validation.
-
-Augmentation philosophy for medical imaging
--------------------------------------------
-Standard ImageNet augmentations are too aggressive for X-rays:
-  * Heavy crops can remove clinically relevant regions (apices, costophrenic
-    angles) where pathology often lives.
-  * Horizontal flips are anatomically wrong (heart must stay on the left).
-  * Color jitter is irrelevant on grayscale X-rays.
-
-We use a conservative set:
-  Train : small random crop (≥90% of image), gentle rotation (±10°),
-          random horizontal flip DISABLED, slight brightness/contrast jitter,
-          resize to 224×224, normalise with ImageNet stats.
-          (ImageNet mean/std are used because we will fine-tune a pretrained
-           model whose weights expect those statistics.)
-  Val/Test: deterministic centre-crop + resize, same normalisation.
+Uses the official train_val_list.txt / test_list.txt splits with a
+patient-level 90/10 train/val split. No horizontal flips (heart position),
+conservative crop (≥90%) to preserve clinically relevant regions.
 """
 
 from pathlib import Path
@@ -65,28 +44,7 @@ IMAGE_SIZE = 224   # standard input size for most pretrained models
 # ── transforms ────────────────────────────────────────────────────────────────
 
 def get_train_transforms() -> transforms.Compose:
-    """
-    Conservative augmentation pipeline for training.
-
-    RandomResizedCrop(scale=(0.9, 1.0))
-        Crops between 90–100 % of the image area then resizes to IMAGE_SIZE.
-        This simulates slight field-of-view variation between scanners while
-        keeping most of the chest in frame.
-
-    RandomRotation(10)
-        Patients are not always perfectly upright; ±10° covers real-world tilt
-        without distorting anatomy.
-
-    ColorJitter(brightness, contrast)
-        X-ray exposure varies between machines and technicians. Small jitter
-        makes the model robust to these intensity differences.
-        (No saturation/hue because the image is effectively grayscale.)
-
-    ToTensor() + Normalize()
-        Scales pixels from [0, 255] → [0, 1], then subtracts ImageNet mean
-        and divides by std so the distribution matches what pretrained weights
-        expect.
-    """
+    """Conservative augmentation — small crop, gentle rotation, no horizontal flip."""
     return transforms.Compose([
         transforms.Resize(256),
         transforms.RandomResizedCrop(IMAGE_SIZE, scale=(0.9, 1.0)),
@@ -98,12 +56,7 @@ def get_train_transforms() -> transforms.Compose:
 
 
 def get_val_transforms() -> transforms.Compose:
-    """
-    Deterministic pipeline for validation and test — no randomness.
-
-    CenterCrop ensures we evaluate on the same region every time, which is
-    important for reproducible metrics.
-    """
+    """Deterministic centre-crop pipeline for val/test."""
     return transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(IMAGE_SIZE),
@@ -116,20 +69,8 @@ def get_val_transforms() -> transforms.Compose:
 
 class ChestXrayDataset(Dataset):
     """
-    Maps each row of a filtered DataFrame to one (image_tensor, label_tensor) pair.
-
-    Args:
-        df          : DataFrame slice for this split (must have 'Image Index'
-                      and one column per DISEASE_LABELS label).
-        image_index : dict mapping filename → full Path, built once at startup.
-        transform   : torchvision transform pipeline.
-
-    __getitem__ returns:
-        image  : FloatTensor of shape (3, H, W)  — 3-channel because PIL
-                 converts 'L' (grayscale) → 'RGB' by repeating the channel.
-                 Pretrained models expect 3 channels.
-        labels : FloatTensor of shape (14,)  — multi-hot vector.
-                 BCEWithLogitsLoss expects float targets, not long integers.
+    Returns (image_tensor, label_tensor) pairs for the NIH CXR-14 dataset.
+    image: FloatTensor (3, H, W), labels: FloatTensor (14,) multi-hot.
     """
 
     def __init__(
@@ -222,40 +163,10 @@ def build_dataloaders(
     seed: int = 42,
 ) -> tuple[DataLoader, DataLoader, DataLoader, torch.Tensor]:
     """
-    Build and return (train_loader, val_loader, test_loader, pos_weights).
+    Return (train_loader, val_loader, test_loader, pos_weights).
 
-    Split strategy
-    --------------
-    The NIH dataset ships with an official train_val_list.txt / test_list.txt
-    that ensures no patient appears in both train and test (patient-level
-    leakage would inflate metrics significantly).
-
-    We honour those files and further split the train_val pool:
-      train : 90% of train_val_list  (stratified by patient)
-      val   : 10% of train_val_list
-      test  : all of test_list        (untouched)
-
-    Weighted sampler
-    ----------------
-    When use_weighted_sampler=True the training DataLoader uses a
-    WeightedRandomSampler that up-samples under-represented disease images.
-    Each image is assigned a weight equal to 1 / (sum of its label counts).
-    This prevents the model from trivially predicting "No Finding" for every
-    image.
-
-    Args:
-        raw_dir              : directory containing CSV + split lists + images
-        batch_size           : images per mini-batch
-        num_workers          : parallel data-loading workers (0 = main process)
-        val_fraction         : fraction of train_val to hold out for validation
-        use_weighted_sampler : whether to apply class-balanced sampling for train
-        seed                 : random seed for reproducibility
-
-    Returns:
-        train_loader : shuffled / sampled DataLoader
-        val_loader   : deterministic DataLoader
-        test_loader  : deterministic DataLoader
-        pos_weights  : FloatTensor(14,) for BCEWithLogitsLoss
+    Follows the official NIH train_val/test split files with a patient-level
+    90/10 train/val split. WeightedRandomSampler up-samples rare-disease images.
     """
     rng = np.random.default_rng(seed)
 

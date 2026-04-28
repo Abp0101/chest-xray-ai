@@ -43,10 +43,8 @@ env/
 *.swo
 .DS_Store
 
-# ── Claude Code local config ──────────────────────────────────────────────────
-# settings.local.json holds machine-specific Claude Code permissions.
-# CLAUDE.md (project instructions) is safe to commit if you create one.
-.claude/settings.local.json
+# ── Local config ──────────────────────────────────────────────────────────────
+.claude/
 
 # ── Outputs (keep figures, ignore large logs) ─────────────────────────────────
 # outputs/figures/ is intentionally NOT ignored so charts can be committed.

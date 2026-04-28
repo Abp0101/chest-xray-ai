@@ -1,33 +1,13 @@
 """
-train.py
---------
-Full training pipeline for the DenseNet-121 chest X-ray classifier.
+Two-stage training pipeline for DenseNet-121 on NIH CXR-14.
+
+Stage 1: backbone frozen, head-only warm-up.
+Stage 2: full network fine-tuned at lower LR with ReduceLROnPlateau.
 
 Usage:
-    python src/train.py                        # default settings
-    python src/train.py --epochs 15 --batch 64 --lr 1e-4
-
-What this script does
----------------------
-1.  Builds the DenseNet-121 model and moves it to MPS (or CPU).
-2.  Builds the DataLoaders (patient-level splits, WeightedRandomSampler).
-3.  Constructs BCEWithLogitsLoss with the pre-computed pos_weights so rare
-    diseases are penalised more heavily.
-4.  Runs two training stages:
-      Stage 1  (warm-up)   : backbone frozen, only the new head trains.
-      Stage 2  (fine-tune) : full network unfrozen, lower LR.
-5.  After every epoch, evaluates on the validation set.
-6.  Saves the best checkpoint (lowest val loss) to outputs/checkpoints/.
-7.  Saves a CSV loss log to outputs/loss_log.csv for later plotting.
-
-Loss function: BCEWithLogitsLoss
----------------------------------
-This is the right choice for multi-label classification:
-  - Each of the 14 outputs is an independent binary prediction.
-  - BCEWithLogitsLoss applies sigmoid internally, which is numerically
-    more stable than calling sigmoid first and then BCELoss.
-  - pos_weight[i] = neg_count[i] / pos_count[i] up-weights the positive
-    (disease-present) term so rare classes are not drowned out.
+    python src/train.py
+    python src/train.py --no-wandb
+    python src/train.py --epochs-stage1 5 --epochs-stage2 20 --batch 64
 """
 
 import argparse
@@ -69,30 +49,7 @@ from dataset import RAW_DIR   # needed for Grad-CAM image lookup in W&B block
 # ── W&B logger ────────────────────────────────────────────────────────────────
 
 class WandbLogger:
-    """
-    Thin wrapper around the wandb API that degrades gracefully when wandb is
-    not installed or when the user passes --no-wandb.
-
-    Design principle: every public method is safe to call unconditionally.
-    The train loop never checks `if use_wandb` inline — it just calls the
-    logger and the logger decides whether to do anything.
-
-    Logged metrics
-    --------------
-    Per epoch (both stages):
-      train/loss    — average BCE loss over the training epoch
-      val/loss      — average BCE loss on the validation set
-      train/lr      — current learning rate (useful to see LR reductions)
-      epoch         — global epoch number (x-axis in W&B charts)
-
-    End of training (media):
-      roc_curves    — the 14-panel ROC curve figure as a W&B Image
-      gradcam_N     — up to 3 Grad-CAM overlay figures as W&B Images
-
-    After full test evaluation:
-      test/mean_auc        — mean AUC-ROC across all 14 classes
-      test/auc_<disease>   — per-class AUC for every label
-    """
+    """Thin W&B wrapper — all methods are no-ops when W&B is disabled or unavailable."""
 
     def __init__(
         self,
@@ -194,20 +151,7 @@ def train_one_epoch(
     device: torch.device,
     epoch: int,
 ) -> float:
-    """
-    Run one full pass over the training DataLoader.
-
-    Returns the average loss per sample for this epoch.
-
-    The inner loop:
-      1. Move batch to device.
-      2. Zero gradients (set_to_none=True is slightly faster than zero_grad()).
-      3. Forward pass → raw logits, shape (B, 14).
-      4. Compute BCEWithLogitsLoss (applies sigmoid internally).
-      5. Backward pass → accumulate gradients.
-      6. Gradient clip → prevents exploding gradients during early stage-2.
-      7. Optimiser step → update weights.
-    """
+    """Run one training epoch and return the mean loss."""
     model.train()
     running_loss = 0.0
     n_batches = len(loader)
@@ -257,14 +201,7 @@ def evaluate(
     criterion: nn.Module,
     device: torch.device,
 ) -> float:
-    """
-    Evaluate the model on a DataLoader without computing gradients.
-
-    @torch.no_grad() disables the autograd engine for the entire function,
-    which halves memory usage and speeds up inference.
-
-    Returns the average loss per batch.
-    """
+    """Return average validation loss over the DataLoader."""
     model.eval()
     running_loss = 0.0
 
@@ -288,17 +225,7 @@ def save_checkpoint(
     val_loss: float,
     path: Path,
 ) -> None:
-    """
-    Save model weights + optimiser state so training can be resumed later.
-
-    We save:
-      - model state_dict   : all learnable parameters
-      - optimizer state_dict : momentum buffers, adaptive learning rates
-      - epoch              : so we know where to resume
-      - val_loss           : so we can compare checkpoints offline
-
-    Note: we save the model on CPU to make the checkpoint device-agnostic.
-    """
+    """Save model + optimiser state to a device-agnostic checkpoint."""
     torch.save(
         {
             "epoch":      epoch,
@@ -359,35 +286,11 @@ def train(
     use_wandb:      bool  = True,
     wandb_project:  str   = "chest-xray-classifier",
 ) -> None:
-    """
-    Full two-stage training loop.
-
-    Stage 1 — head warm-up  (epochs_stage1 epochs)
-        Backbone frozen, only Linear(1024→14) trains.
-        Higher LR is safe because only a small number of parameters update.
-        Adam is a good default: adapts the LR per parameter, robust to the
-        sparse gradient signal typical of multi-label problems.
-
-    Stage 2 — full fine-tune  (epochs_stage2 epochs)
-        Backbone unfrozen, entire network trains end-to-end.
-        Lower LR preserves the pretrained features while letting the backbone
-        adapt to X-ray statistics.
-        ReduceLROnPlateau halves the LR when val loss stops improving for
-        2 consecutive epochs — prevents over-shooting a good minimum.
-
-    Checkpoint policy:
-        The best-val-loss checkpoint is always saved as best_model.pth.
-        Every epoch also saves last_model.pth so you can resume if the
-        process is interrupted.
-    """
+    """Run the full two-stage training loop and save checkpoints."""
     torch.manual_seed(seed)
     device = get_device()
     print(f"Training on device: {device}\n")
 
-    # ── W&B ───────────────────────────────────────────────────────────────────
-    # Initialise before any training so hyperparameters are captured in the run.
-    # Passing the full config dict means every hyperparameter is searchable and
-    # comparable across runs in the W&B UI.
     wb = WandbLogger(
         enabled=use_wandb,
         project=wandb_project,
@@ -416,10 +319,6 @@ def train(
     print("Building model …")
     model = build_model(dropout=dropout).to(device)
 
-    # ── loss ──────────────────────────────────────────────────────────────────
-    # pos_weights is a (14,) tensor where pos_weights[i] = neg_i / pos_i.
-    # BCEWithLogitsLoss uses it to scale the positive-class contribution of
-    # each label, so rare diseases count proportionally more in the loss.
     criterion = nn.BCEWithLogitsLoss(
         pos_weight=pos_weights.to(device)
     )
@@ -439,9 +338,6 @@ def train(
 
     freeze_backbone(model)
 
-    # Only pass parameters that require gradients to the optimiser.
-    # This is both more efficient and avoids an error in some PyTorch versions
-    # when frozen parameters appear in the optimiser's parameter groups.
     optimizer_s1 = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=lr_stage1,
@@ -491,10 +387,7 @@ def train(
 
     unfreeze_backbone(model)
 
-    # A fresh Adam optimiser for stage 2 resets momentum buffers.
-    # This avoids the large momentum accumulated during stage 1 (which was
-    # aimed at the head weights) from pulling the backbone in a bad direction
-    # on the very first stage-2 update.
+    # Fresh optimiser resets stage-1 momentum before fine-tuning the backbone.
     optimizer_s2 = torch.optim.Adam(
         model.parameters(),
         lr=lr_stage2,
@@ -552,10 +445,6 @@ def train(
     print(f"Best checkpoint : {CKPT_DIR / 'best_model.pth'}")
     print(f"Loss log        : {LOSS_LOG_PATH}")
 
-    # ── W&B — post-training media and metrics ─────────────────────────────────
-    # We defer AUC computation and Grad-CAM to here so they don't slow down
-    # the training loop.  We load the BEST checkpoint (not last) to ensure
-    # the logged metrics reflect the model we're actually shipping.
     if wb.enabled:
         print("\nRunning post-training evaluation for W&B …")
         from evaluate import (

@@ -1,35 +1,9 @@
 """
-app.py
-------
-Gradio demo for the NIH Chest X-Ray 14 classifier.
-Designed to run as a Hugging Face Spaces app or locally.
+Gradio demo for the NIH CXR-14 classifier.
+Runs locally or as a Hugging Face Space.
 
-Usage (local):
-    pip install gradio huggingface_hub
-    python app.py
-
-Usage (HF Spaces):
-    Push this repo to a Hugging Face Space (SDK: Gradio).
-    Upload your trained checkpoint to HF Hub and set HF_MODEL_REPO below,
-    or commit best_model.pth directly into the Space repo (≤100 MB limit
-    means you should use Git LFS or HF Hub model hosting).
-
-What the demo does
-------------------
-1. User uploads a chest X-ray image (any format PIL can read).
-2. The image is preprocessed with the same val-time transforms used in
-   training (Resize 256 → CenterCrop 224 → ImageNet normalise).
-3. DenseNet-121 runs a forward pass → 14 sigmoid probabilities.
-4. Grad-CAM highlights which regions drove the top prediction.
-5. Returns:
-     - A Grad-CAM overlay image (original X-ray with heatmap blended in)
-     - A bar chart of all 14 predicted probabilities
-     - A plain-text summary of the top 3 findings
-
-Disclaimer
-----------
-This tool is for research and educational purposes only.
-It is NOT a medical device and must NOT be used for clinical decision-making.
+Upload a chest X-ray → get 14 disease probabilities, a Grad-CAM overlay,
+and a plain-text summary of the top predictions.
 """
 
 import os
@@ -67,10 +41,7 @@ HF_MODEL_FILENAME = "best_model.pth"
 
 
 def _get_device() -> torch.device:
-    """
-    Pick the best available device.
-    Order of preference: CUDA (Spaces GPU) → MPS (Apple Silicon) → CPU.
-    """
+    """Return CUDA → MPS → CPU, whichever is available."""
     if torch.cuda.is_available():
         return torch.device("cuda")
     if torch.backends.mps.is_available():
@@ -79,10 +50,7 @@ def _get_device() -> torch.device:
 
 
 def _load_checkpoint() -> Path:
-    """
-    Return a path to the checkpoint, downloading from HF Hub if necessary.
-    Raises FileNotFoundError if neither local nor Hub source is available.
-    """
+    """Return path to checkpoint, downloading from HF Hub if not found locally."""
     if LOCAL_CKPT.exists():
         return LOCAL_CKPT
 
@@ -137,17 +105,7 @@ TRANSFORM = get_val_transforms()
 # ── inference helpers ─────────────────────────────────────────────────────────
 
 def _build_prob_chart(probs: np.ndarray) -> Image.Image:
-    """
-    Render a horizontal bar chart of all 14 predicted probabilities and
-    return it as a PIL Image.
-
-    We return PIL instead of a matplotlib Figure to avoid gr.Plot, which
-    generates a complex JSON schema that triggers a bool-iteration bug in
-    gradio_client<=1.3.0.  gr.Image accepts PIL directly and has a simple,
-    bug-free schema.
-
-    A vertical red line at 0.5 marks a naive decision threshold.
-    """
+    """Render a horizontal bar chart of all 14 probabilities as a PIL Image."""
     import io
 
     sorted_idx    = np.argsort(probs)          # ascending
@@ -183,12 +141,7 @@ def _build_gradcam_overlay(
     tensor:       torch.Tensor,   # (1, 3, 224, 224) on DEVICE
     target_class: int,
 ) -> np.ndarray:
-    """
-    Run Grad-CAM and return an RGB uint8 blend image (224, 224, 3).
-
-    We create and immediately destroy the GradCAM object so hooks don't
-    accumulate across requests (important in a long-running server process).
-    """
+    """Run Grad-CAM and return an RGB uint8 blend (224, 224, 3)."""
     grad_cam = GradCAM(_model, target_layer_name="features.denseblock4")
     cam, _, _ = grad_cam.generate(tensor, target_class=target_class)
     grad_cam.remove_hooks()
@@ -206,17 +159,7 @@ def _build_gradcam_overlay(
 # ── main prediction function ──────────────────────────────────────────────────
 
 def predict(uploaded_image: Image.Image):
-    """
-    Entry point called by Gradio for every user request.
-
-    Args:
-        uploaded_image : PIL Image provided by the user.
-
-    Returns:
-        gradcam_overlay : PIL Image — Grad-CAM heatmap blended onto the X-ray.
-        prob_chart      : matplotlib Figure — bar chart of all 14 probabilities.
-        summary_text    : str — plain-text top-3 findings for screen readers.
-    """
+    """Run inference and return (gradcam_overlay, prob_chart, summary_text)."""
     if not MODEL_READY:
         error_msg = (
             "Model checkpoint not found. "
@@ -225,13 +168,9 @@ def predict(uploaded_image: Image.Image):
         # Return empty outputs with error message
         return None, None, error_msg
 
-    # ── preprocess ────────────────────────────────────────────────────────────
-    # Convert to RGB in case the user uploaded a grayscale or RGBA image.
-    # The same RGB conversion is applied during training (dataset.py).
     image_rgb = uploaded_image.convert("RGB")
     tensor    = TRANSFORM(image_rgb).unsqueeze(0).to(DEVICE)   # (1,3,224,224)
 
-    # ── inference ─────────────────────────────────────────────────────────────
     with torch.no_grad():
         logits = _model(tensor)              # (1, 14)
         probs  = torch.sigmoid(logits)       # (1, 14) in [0,1]
@@ -241,16 +180,11 @@ def predict(uploaded_image: Image.Image):
     # Top predicted class drives the Grad-CAM explanation
     top_class = int(np.argmax(probs_np))
 
-    # ── Grad-CAM overlay ──────────────────────────────────────────────────────
-    # Grad-CAM needs gradients, so we do NOT use torch.no_grad() here.
     blend_np     = _build_gradcam_overlay(tensor, top_class)
     gradcam_pil  = Image.fromarray(blend_np)
 
-    # ── probability chart ─────────────────────────────────────────────────────
     prob_fig = _build_prob_chart(probs_np)
 
-    # ── plain-text summary ────────────────────────────────────────────────────
-    # Sort by probability descending; show top 3 with probabilities
     top3_idx = np.argsort(probs_np)[::-1][:3]
     lines    = ["Top predictions:"]
     for i, idx in enumerate(top3_idx, 1):
@@ -268,8 +202,6 @@ def predict(uploaded_image: Image.Image):
 
 import gradio as gr
 
-# Example images that load into the interface on the HF Spaces page.
-# Remove this list if you don't have example files in the repo.
 EXAMPLES_DIR = PROJECT_ROOT / "outputs" / "figures"
 example_files = sorted(EXAMPLES_DIR.glob("gradcam_*.png"))[:2]
 examples = [[str(p)] for p in example_files] if example_files else None
